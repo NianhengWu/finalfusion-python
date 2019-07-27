@@ -1,4 +1,5 @@
 use std::cell::RefCell;
+use std::collections::HashSet;
 use std::fs::File;
 use std::io::{BufReader, BufWriter};
 use std::rc::Rc;
@@ -9,11 +10,11 @@ use finalfusion::prelude::*;
 use finalfusion::similarity::*;
 use itertools::Itertools;
 use ndarray::Array2;
-use numpy::{IntoPyArray, PyArray1, PyArray2};
+use numpy::{IntoPyArray, NpyDataType, PyArray1, PyArray2};
 use pyo3::class::iter::PyIterProtocol;
 use pyo3::prelude::*;
-use pyo3::types::PyTuple;
-use pyo3::{exceptions, PyMappingProtocol};
+use pyo3::types::{PyAny, PyList, PySet, PyTuple};
+use pyo3::{exceptions, PyMappingProtocol, PyTypeInfo};
 use toml::{self, Value};
 
 use crate::{EmbeddingsWrap, PyEmbeddingIterator, PyVocab, PyWordSimilarity};
@@ -95,18 +96,7 @@ impl PyEmbeddings {
                 exceptions::KeyError::py_err(format!("Unknown word or n-grams: {}", failed))
             })?;
 
-        let mut r = Vec::with_capacity(results.len());
-        for ws in results {
-            r.push(
-                Py::new(
-                    py,
-                    PyWordSimilarity::new(ws.word.to_owned(), ws.similarity.into_inner()),
-                )?
-                .into_object(py),
-            )
-        }
-
-        Ok(r)
+        Self::similarity_results(py, results)
     }
 
     /// Get the embedding for the given word.
@@ -210,7 +200,7 @@ impl PyEmbeddings {
 
     /// Perform a similarity query.
     #[args(limit = 10)]
-    fn similarity(&self, py: Python, word: &str, limit: usize) -> PyResult<Vec<PyObject>> {
+    fn word_similarity(&self, py: Python, word: &str, limit: usize) -> PyResult<Vec<PyObject>> {
         let embeddings = self.embeddings.borrow();
 
         let embeddings = embeddings.view().ok_or_else(|| {
@@ -223,18 +213,46 @@ impl PyEmbeddings {
             .word_similarity(word, limit)
             .ok_or_else(|| exceptions::KeyError::py_err("Unknown word and n-grams"))?;
 
-        let mut r = Vec::with_capacity(results.len());
-        for ws in results {
-            r.push(
-                Py::new(
-                    py,
-                    PyWordSimilarity::new(ws.word.to_owned(), ws.similarity.into_inner()),
-                )?
-                .into_object(py),
+        Self::similarity_results(py, results)
+    }
+
+    /// Perform a similarity query based on a query embedding.
+    #[args(limit = 10, skip = "None")]
+    fn embedding_similarity(
+        &self,
+        py: Python,
+        embedding: Embedding,
+        skip: Option<Option<Skips>>,
+        limit: usize,
+    ) -> PyResult<Vec<PyObject>> {
+        let embeddings = self.embeddings.borrow();
+
+        let embeddings = embeddings.view().ok_or_else(|| {
+            exceptions::ValueError::py_err(
+                "Similarity queries are not supported for this type of embedding matrix",
             )
+        })?;
+
+        let embedding = embedding.0.as_array();
+
+        if embedding.shape()[0] != embeddings.storage().shape().1 {
+            return Err(exceptions::ValueError::py_err(format!(
+                "Incompatible embedding shapes: embeddings: ({},), query: ({},)",
+                embedding.shape()[0],
+                embeddings.storage().shape().1
+            )));
         }
 
-        Ok(r)
+        let results = if let Some(Some(skip)) = skip {
+            embeddings.embedding_similarity_masked(embedding, limit, &skip.0)
+        } else {
+            embeddings.embedding_similarity(embedding, limit)
+        };
+
+        Self::similarity_results(
+            py,
+            results.ok_or_else(|| exceptions::KeyError::py_err("Unknown word and n-grams"))?,
+        )
     }
 
     /// Write the embeddings to a finalfusion file.
@@ -253,6 +271,25 @@ impl PyEmbeddings {
                 .write_embeddings(&mut writer)
                 .map_err(|err| exceptions::IOError::py_err(err.to_string())),
         }
+    }
+}
+
+impl PyEmbeddings {
+    fn similarity_results(
+        py: Python,
+        results: Vec<WordSimilarityResult>,
+    ) -> PyResult<Vec<PyObject>> {
+        let mut r = Vec::with_capacity(results.len());
+        for ws in results {
+            r.push(
+                Py::new(
+                    py,
+                    PyWordSimilarity::new(ws.word.to_owned(), ws.similarity.into_inner()),
+                )?
+                .into_object(py),
+            )
+        }
+        Ok(r)
     }
 }
 
@@ -297,4 +334,48 @@ where
     };
 
     Ok(embeddings)
+}
+
+struct Skips<'a>(HashSet<&'a str>);
+
+impl<'a> FromPyObject<'a> for Skips<'a> {
+    fn extract(ob: &'a PyAny) -> Result<Self, PyErr> {
+        let mut set = ob
+            .len()
+            .map(|len| HashSet::with_capacity(len))
+            .unwrap_or_default();
+
+        let iter = if <PySet as PyTypeInfo>::is_instance(ob) {
+            ob.iter().unwrap()
+        } else if <PyList as PyTypeInfo>::is_instance(ob) {
+            ob.iter().unwrap()
+        } else {
+            return Err(exceptions::TypeError::py_err("Iterable expected"));
+        };
+
+        for el in iter {
+            set.insert(
+                el?.extract()
+                    .map_err(|_| exceptions::TypeError::py_err("Expected String"))?,
+            );
+        }
+        Ok(Skips(set))
+    }
+}
+
+struct Embedding<'a>(&'a PyArray1<f32>);
+
+impl<'a> FromPyObject<'a> for Embedding<'a> {
+    fn extract(ob: &'a PyAny) -> Result<Self, PyErr> {
+        let embedding = ob
+            .downcast_ref::<PyArray1<f32>>()
+            .map_err(|_| exceptions::TypeError::py_err("Expected array with dtype Float32"))?;
+        if embedding.data_type() != NpyDataType::Float32 {
+            return Err(exceptions::TypeError::py_err(format!(
+                "Expected dtype Float32, got {:?}",
+                embedding.data_type()
+            )));
+        };
+        Ok(Embedding(embedding))
+    }
 }
